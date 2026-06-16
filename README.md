@@ -30,20 +30,28 @@ The script can be used to test connections:
 - Infrastructure migration checks
 - Network troubleshooting between Windows and Linux systems
 
+## Supported Scenarios
+
+- Windows → Windows
+- Windows → Linux
+- Linux → Windows
+- Firewall validation
+- Application port validation
+
 ## Install Requirements
 
-```powershell
+``` powershell
 Install-Module -Name Posh-SSH
 ```
 
 ## Usage
 
-```
+``` powershell
 .\TestPort.ps1 -T [port_type] -L [local_port] -R [remote_port]
 ```
 
 ## Example
 
-```
-.\TestPort.ps1 -T UDP -L 80,443,10050
-.\TestPort.ps1 -T TCP -L 10050,10051 -R 8080,8443
+``` powershell
+.\TestPort.ps1 -T TCP -L 80,443,10050 -R 8080,8443
+.\TestPort.ps1 -T UDP -R 161
