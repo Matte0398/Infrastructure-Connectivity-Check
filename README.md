@@ -1,4 +1,4 @@
-# Connectivity Tool Check
+# Infrastructure-Connectivity-Check
 
 PowerShell utility for testing network connectivity between infrastructure systems.
 The script can be used to test connections:
