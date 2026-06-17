@@ -44,7 +44,7 @@ The script can be used to test connections:
 Install-Module -Name Posh-SSH
 ```
 
-## Input File
+## Input
 
 By default, the script reads the list of systems from:
 
