@@ -49,8 +49,8 @@ Enable-PSRemoting -Force
 | Parameter | Alias | Mandatory | Description |
 |---|---|---|---|
 | `-port_type` | `-T` | Yes | Protocol to test: `TCP` or `UDP` (case-insensitive) |
-| `-ports_local_to_remote` | `-L` | Yes | Comma-separated list of ports to test from local to remote (e.g. `5985,3389,8080`) |
-| `-ports_remote_to_local` | `-R` | No | Comma-separated list of ports to test from remote to local (e.g. `8080,3183`) |
+| `-ports_local_to_remote`  | `-L` | Yes | Comma-separated list of ports to test from local to remote (e.g. `5985,3389,8080`) |
+| `-ports_remote_to_local`  | `-R` | No | Comma-separated list of ports to test from remote to local (e.g. `8080,3183`) |
 
 **Notes:**
 - Invalid port values (non-numeric, out of range 1–65535) are automatically ignored with a warning.
