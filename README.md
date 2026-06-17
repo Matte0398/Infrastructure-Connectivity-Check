@@ -78,3 +78,13 @@ Generated files:
 ``` powershell
 .\TestPort.ps1 -T TCP -L 80,443,10050 -R 8080,8443
 .\TestPort.ps1 -T UDP -R 161
+```
+
+## Repository Structure
+
+``` text
+Infrastructure-Connectivity-Check/
+│   TestPort.ps1
+├── examples/
+│   ├── system.txt
+└── README.md
