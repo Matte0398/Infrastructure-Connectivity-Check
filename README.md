@@ -76,8 +76,13 @@ Generated files:
 ## Example
 
 ``` powershell
-.\TestPort.ps1 -T TCP -L 80,443,10050 -R 8080,8443
-.\TestPort.ps1 -T UDP -R 161
+Run a TCP test from the local machine to the remote systems on ports 80, 443 and 10050, and from the remote systems back to the local machine on ports 8080 and 8443:
+
+  .\TestPort.ps1 -T TCP -L 80,443,10050 -R 8080,8443
+
+Run a UDP test from the remote systems to the local machine on port 161:
+
+  .\TestPort.ps1 -T UDP -R 161
 ```
 
 ## Repository Structure
