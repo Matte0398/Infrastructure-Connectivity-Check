@@ -44,6 +44,29 @@ The script can be used to test connections:
 Install-Module -Name Posh-SSH
 ```
 
+## Input File
+
+By default, the script reads the list of systems from:
+
+``` text
+C:\temp\system.txt
+
+server01
+192.168.1.11
+```
+
+## Output
+
+By default, the script creates output files under:
+
+``` text
+C:\temp
+
+Generated files:
+
+  C:\temp\log_connection-<timestamp>.log
+```
+
 ## Usage
 
 ``` powershell
