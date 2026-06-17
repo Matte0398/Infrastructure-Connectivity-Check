@@ -1,99 +1,175 @@
 # Infrastructure-Connectivity-Check
 
-PowerShell utility for testing network connectivity between infrastructure systems.
-The script can be used to test connections:
+## Description
 
-- From a Windows system to a remote Windows or Linux system
-- From a remote system back to the local Windows system
-- On specific TCP or UDP ports
+PowerShell script that tests TCP or UDP port connectivity between a **local Windows machine** and one or more **remote systems** (Windows or Linux). It supports testing ports in both directions:
 
-## Features
+- **Local → Remote:** tests whether specified ports are open on the remote systems
+- **Remote → Local:** tests whether specified ports are open on the local machine, as seen from each remote system
 
-- TCP port checks
-- UDP port checks
-- Local-to-remote connectivity tests
-- Remote-to-local connectivity tests
-- Support for Windows and Linux remote systems
-- Input validation for port numbers
-- Connectivity logs
-- Useful for infrastructure troubleshooting and monitoring validation
+All results are saved to a timestamped log file.
 
 ## Requirements
 
-- Windows PowerShell
-- Network access to the target systems
-- Posh-SSH PowerShell module when testing from remote Linux systems
+### On the LOCAL machine (always required)
 
-## Use Cases
-- Firewall rule validation
-- Application port checks
-- Infrastructure migration checks
-- Network troubleshooting between Windows and Linux systems
+- **PowerShell 5.1** or later
+- A file `C:\temp\system.txt` with the list of remote systems to test
 
-## Supported Scenarios
+### For Remote → Local tests on **Linux** remote systems
 
-- Windows → Windows
-- Windows → Linux
-- Linux → Windows
-- Firewall validation
-- Application port validation
+The **Posh-SSH** PowerShell module must be installed on the local machine:
 
-## Install Requirements
-
-``` powershell
-Install-Module -Name Posh-SSH
+```powershell
+Install-Module -Name Posh-SSH -Force
 ```
 
-## Input
+The **netcat** (`nc`) utility must be installed on each Linux remote system:
 
-By default, the script reads the list of systems from:
+```bash
+# Debian/Ubuntu
+sudo apt-get install netcat -y
 
-``` text
-C:\temp\system.txt
+# RHEL/CentOS
+sudo yum install nmap-ncat -y
+```
 
+### For Remote → Local tests on **Windows** remote systems
+
+- **WinRM** must be enabled on the remote Windows system (see below)
+- The remote user must have PowerShell Remoting access
+
+```powershell
+# On the remote Windows system, run as Administrator
+Enable-PSRemoting -Force
+```
+
+## Parameters
+
+| Parameter | Alias | Mandatory | Description |
+|---|---|---|---|
+| `-port_type` | `-T` | Yes | Protocol to test: `TCP` or `UDP` (case-insensitive) |
+| `-ports_local_to_remote` | `-L` | Yes | Comma-separated list of ports to test from local to remote (e.g. `5985,3389,8080`) |
+| `-ports_remote_to_local` | `-R` | No | Comma-separated list of ports to test from remote to local (e.g. `8080,3183`) |
+
+**Notes:**
+- Invalid port values (non-numeric, out of range 1–65535) are automatically ignored with a warning.
+- If `-R` is omitted, only the local → remote direction is tested.
+
+## Configuration File
+
+### `C:\temp\system.txt` — list of remote systems
+
+One entry per line. Each entry can be a **hostname** or an **IP address**:
+
+```
 server01
-192.168.1.11
+192.168.1.20
+linux-host01
+192.168.1.35
 ```
+
+**Rules:**
+- One system per line
+- Blank lines are skipped
+- If a system does not respond to ping, it is skipped entirely
+
+## Running the Script
+
+Open PowerShell as **Administrator** and run:
+
+```powershell
+# First run only: allow script execution
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# 1) Test TCP ports from local to remote only
+.\TestPort.ps1 -T TCP -L 5985,3389
+
+# 2) Test UDP ports from local to remote only
+.\TestPort.ps1 -T UDP -L 161,162
+
+# 3) Test TCP ports in both directions (local→remote AND remote→local)
+.\TestPort.ps1 -T TCP -L 5985,3389 -R 8080,3183
+
+# 4) Using aliases (shorter form)
+.\TestPort.ps1 -T tcp -L 443,80 -R 8443
+```
+
+## OS Detection (Remote → Local tests)
+
+When `-R` is specified, the script automatically detects the OS of each remote system before testing:
+
+| Check | Result |
+|---|---|
+| Port **3389/TCP** open | Remote system is **Windows** |
+| Port **22/TCP** open | Remote system is **Linux** |
+| Neither port open | Remote system is **Unrecognized** — remote → local test is skipped |
+
+For **Windows** remote systems, the test is performed via `Invoke-Command` (WinRM).  
+For **Linux** remote systems, the test is performed via SSH (`Posh-SSH`) using the `netcat` command.
+
+## Credentials (Remote → Local tests only)
+
+Credentials are required only when testing the remote → local direction. The script caches credentials per remote system in an encrypted `.cred` file under `C:\temp\`:
+
+```
+C:\temp\file_cred_<system_name>.cred
+```
+
+If the file already exists, it is reused automatically. If not, a credential prompt appears the first time.
+
+> **Note:** To force a fresh credential prompt, delete the corresponding `.cred` file before running the script.
 
 ## Output
 
-By default, the script creates output files under:
+### Log file
 
-``` text
-C:\temp
+A timestamped log file is created at each run:
+
+```
+C:\temp\log_connection-YYYY-MM-DD_HH-mm-ss.log
 ```
 
-Generated files:
+The log contains, for each remote system:
+- Ping result
+- OS detection result (when `-R` is used)
+- Port test result for each port in each direction
 
-``` text
-  C:\temp\log_connection-<timestamp>.log
+**Example log output:**
+
+```
+Tests made from MYPC (192.168.1.5)
+---------------------------------------
+
+1) Remote system = server01
+
+    Ping OK
+    Port TCP 5985 opened on remote system
+    Port TCP 3389 opened on remote system
+    OS remote system: Windows
+    Port TCP 8080 opened on local system
+    Attention!! Port TCP 3183 closed on local system!
+
+2) Remote system = 192.168.1.99
+
+    Ping KO
 ```
 
-## Usage
+## UDP Testing — Important Note
 
-``` powershell
-.\TestPort.ps1 -T [port_type] -L [local_port] -R [remote_port]
-```
+> UDP is a **connectionless** protocol. An open UDP port may not send any response to a probe packet, which means:
+> - A **timeout** is interpreted as "closed" even if the port is actually open and filtering responses.
+> - UDP test results should be considered **indicative only**.
 
-## Example
+For reliable UDP testing, use dedicated tools (e.g. `nmap`) in addition to this script.
 
-Run a TCP test from the local machine to the remote systems on ports 80, 443 and 10050, and from the remote systems back to the local machine on ports 8080 and 8443:
+## Troubleshooting
 
-``` powershell
-.\TestPort.ps1 -T TCP -L 80,443,10050 -R 8080,8443
-```
-
-Run a UDP test from the remote systems to the local machine on port 161:
-
-``` powershell
-.\TestPort.ps1 -T UDP -R 161
-```
-
-## Repository Structure
-
-``` text
-Infrastructure-Connectivity-Check/
-│   TestPort.ps1
-├── examples/
-│   ├── system.txt
-└── README.md
+| Problem | Solution |
+|---|---|
+| `Posh-SSH module not found` | Run `Install-Module -Name Posh-SSH -Force` as Administrator |
+| `netcat not found on remote Linux` | Install `nc` on the Linux remote system (see Requirements) |
+| Ping fails for a known-online system | The system may block ICMP — check firewall rules on the remote host |
+| Remote → Local test fails on Windows | Verify WinRM is enabled on the remote system and credentials are correct |
+| `.cred` file causes auth errors | Delete `C:\temp\file_cred_<system>.cred` and re-run to re-enter credentials |
+| `system.txt not found` | Create the file at `C:\temp\system.txt` with one hostname or IP per line |
