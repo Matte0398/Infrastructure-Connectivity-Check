@@ -6,9 +6,17 @@
 ###########################################################################################################################################
 
 param (
-    [Parameter()] [Alias('T')] [string]$port_type,
-    [Parameter()] [Alias('L')] [string]$ports_local_to_remote,
-    [Parameter()] [Alias('R')] [string]$ports_remote_to_local
+    [Parameter()] [Alias('T')] [ValidateSet('TCP','UDP')] [string]$port_type,
+    # object[] accepts both PowerShell arrays (-L 80,443) and quoted CSV values (-L "80,443").
+    [Parameter()] [Alias('L')] [object[]]$ports_local_to_remote,
+    [Parameter()] [Alias('R')] [object[]]$ports_remote_to_local,
+    [ValidateSet('Auto','Windows','Linux')] [string]$RemoteOS = 'Auto',
+    [ValidateRange(100,60000)] [int]$Timeout = 1000,
+    [string]$WorkDirectory = 'C:\temp',
+    [string]$SystemListPath,
+    [PSCredential]$Credential,
+    [switch]$SaveCredential,
+    [switch]$TrustSshHostKey
 )
 
 function print_usage {
@@ -28,7 +36,7 @@ function print_usage {
     Write-Host -ForegroundColor "red" "`nScript operations:"
     Write-Host " - It creates the working folder if it does not exist: $work_dir"
     Write-Host " - It reads a list of remote systems in: $system_list"
-    Write-Host " - Initially it tries to ping the systems reported in the file (if a system is unreachable, it goes to the next one)"
+    Write-Host " - It records the ping result, but continues the port tests because ICMP may be blocked"
     Write-Host " - It ignores invalid ports and keeps only numeric values between 1 and 65535"
     Write-Host " - It tests some connections from local system to remote system"
     Write-Host " - If you launch as 2), it verifies if the remote system is Windows or Linux"
@@ -57,6 +65,8 @@ function Test-Port {
         $connect = $null
 
         try {
+            # BeginConnect is used instead of Connect so that this script controls the timeout.
+            # EndConnect is still required: a signaled wait handle does not guarantee success.
             $connect = $tcpClient.BeginConnect($ComputerName, $Port, $null, $null)
             $wait = $connect.AsyncWaitHandle.WaitOne($Timeout, $false)
 
@@ -78,6 +88,8 @@ function Test-Port {
         $udpClient = New-Object System.Net.Sockets.UdpClient
 
         try {
+            # UDP has no connection handshake. Only an application reply can confirm
+            # that the service answered; a timeout is therefore treated as inconclusive.
             $udpClient.Client.ReceiveTimeout = $Timeout
             $udpClient.Connect($ComputerName, $Port)
             $a = New-Object System.Text.ASCIIEncoding
@@ -101,9 +113,24 @@ function Test-Port {
     return $result
 }
 
+function Get-LocalIpForRemoteSystem {
+    param ([string]$ComputerName)
+    $client = New-Object System.Net.Sockets.UdpClient
+    try {
+        # Connect() on a UDP socket selects the route and local interface without
+        # sending traffic. This avoids choosing an unrelated VPN/network adapter.
+        $client.Connect($ComputerName, 65530)
+        return ([System.Net.IPEndPoint]$client.Client.LocalEndPoint).Address.IPAddressToString
+    } catch {
+        return $null
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function Convert-ToPortList {
     param (
-        [string]$Ports,
+        [object[]]$Ports,
         [string]$ParameterName
     )
 
@@ -113,7 +140,8 @@ function Convert-ToPortList {
         return $port_list
     }
 
-    foreach ($item in ($Ports -split ",")) {
+    # Normalize both array and CSV input to a single sequence of candidate values.
+    foreach ($item in (($Ports -join ',') -split ",")) {
         $clean_item = $item.Trim()
         $port_number = 0
 
@@ -128,6 +156,11 @@ function Convert-ToPortList {
 }
 
 function Import-PoshSSHModule {
+    # Avoid importing the module repeatedly during OS detection and Linux tests.
+    if (Get-Module -Name Posh-SSH) {
+        return $true
+    }
+
     try {
         Import-Module Posh-SSH -ErrorAction Stop
         return $true
@@ -148,6 +181,8 @@ function Test-Port_LocalToRemote {
 
             if ($result) {
                 "`tPort $port_type $port opened on remote system" >> $log_connection
+            } elseif ($port_type -eq 'UDP') {
+                "`tPort UDP ${port}: no reply received; result inconclusive" >> $log_connection
             } else {
                 "`tAttention!! Port $port_type $port closed on remote system!" >> $log_connection
             }
@@ -158,35 +193,81 @@ function Test-Port_LocalToRemote {
 }
 
 function Test-OS_System {
-    Start-Sleep -Seconds 1.5
-    # to verify if the system is a Windows (port RDP: 3389/TCP) or a Linux (port SSH: 22/TCP)
-    $result = Test-Port -ComputerName $system -Port 3389 -Protocol TCP -Timeout $Timeout
-    # Write-Host "Windows? $result"
-    
-    if ($result) {
-        $flag_OS = "Windows"
-    } else {
-        $result = Test-Port -ComputerName $system -Port 22 -Protocol TCP -Timeout $Timeout
-        # Write-Host "Linux? $result"
-        
-        if ($result) {
-            $flag_OS = "Linux"
-        } else {
-            $flag_OS = "Unrecognized"
+    param ([PSCredential]$cred)
+
+    if ($RemoteOS -ne 'Auto') {
+        "`tOS remote system: $RemoteOS (specified by parameter)" >> $log_connection
+        return $RemoteOS
+    }
+
+    # In Auto mode, detect the remote execution mechanism that is actually usable.
+    # A successful WinRM session identifies Windows more reliably than checking RDP/3389.
+    $flag_OS = $null
+    $winrmError = $null
+    $sshError = $null
+    $probeSession = $null
+    try {
+        $sessionOption = New-PSSessionOption -OpenTimeout $Timeout
+        $probeSession = New-PSSession -ComputerName $system -Credential $cred -SessionOption $sessionOption -ErrorAction Stop
+        $flag_OS = 'Windows'
+    } catch {
+        $winrmError = $_.Exception.Message
+    } finally {
+        if ($probeSession) {
+            Remove-PSSession -Session $probeSession -ErrorAction SilentlyContinue
         }
     }
-    
+
+    if (-not $flag_OS) {
+        # If WinRM is unavailable, try SSH and verify Linux with uname. Merely finding
+        # SSH open is insufficient because Windows can also run an OpenSSH server.
+        $probeSession = $null
+        try {
+            if (-not (Import-PoshSSHModule)) {
+                throw "The Posh-SSH module is not available."
+            }
+            $sshArgs = @{
+                ComputerName = $system
+                Credential   = $cred
+                ErrorAction  = 'Stop'
+            }
+            if ($TrustSshHostKey) { $sshArgs.AcceptKey = $true }
+            $probeSession = New-SSHSession @sshArgs
+            $osProbe = Invoke-SSHCommand -SSHSession $probeSession -Command 'uname -s' -ErrorAction Stop
+            if ($osProbe.ExitStatus -eq 0 -and (($osProbe.Output -join ' ') -match '^Linux')) {
+                $flag_OS = 'Linux'
+            } else {
+                $flag_OS = 'Unrecognized'
+                $sshError = "SSH connected, but 'uname -s' did not identify Linux."
+            }
+        } catch {
+            $sshError = $_.Exception.Message
+            $flag_OS = 'Unrecognized'
+        } finally {
+            if ($probeSession) {
+                Remove-SSHSession -SSHSession $probeSession | Out-Null
+            }
+        }
+    }
+
     "`tOS remote system: $flag_OS" >> $log_connection
+    if ($flag_OS -eq 'Unrecognized') {
+        "`tWinRM probe failed: $winrmError" >> $log_connection
+        "`tSSH probe failed: $sshError" >> $log_connection
+    }
 
     return $flag_OS
 }
 
-function obtain_cred {
-    if (Test-Path $file_cred -PathType leaf) {
+function Get-SavedCredential {
+    if ($Credential) { return $Credential }
+    # Export-Clixml encrypts the password with Windows DPAPI. The resulting file can
+    # normally be decrypted only by the same Windows user on the same computer.
+    if ($SaveCredential -and (Test-Path $file_cred -PathType leaf)) {
         $cred = Import-Clixml -Path $file_cred
     } else {
         $cred = (Get-Credential -Message "Type the credential to login on remote system")
-        $cred | Export-Clixml -Path $file_cred
+        if ($SaveCredential) { $cred | Export-Clixml -Path $file_cred }
     }
 
     return $cred
@@ -208,11 +289,24 @@ function Test-Port_RemoteToLocal {
         if ($port -gt 0 -and $port -le 65535) {
             if ($flag_OS -eq "Windows") {
                 try {
-                    $cred = obtain_cred
+                    # This block runs on the Windows remote host, so the target is the
+                    # local address and the result describes the reverse direction.
                     $result = Invoke-Command -ComputerName $system -Credential $cred -ErrorAction Stop -ScriptBlock {
                         param ($target_ip, $target_port, $target_protocol, $timeout_ms)
                         if ($target_protocol -eq "TCP") {
-                            return Test-NetConnection -ComputerName $target_ip -Port $target_port -InformationLevel Quiet
+                            $client = New-Object System.Net.Sockets.TcpClient
+                            $async = $null
+                            try {
+                                # Keep the same explicit timeout used by the local TCP test.
+                                $async = $client.BeginConnect($target_ip, $target_port, $null, $null)
+                                if (-not $async.AsyncWaitHandle.WaitOne($timeout_ms, $false)) { return $false }
+                                $client.EndConnect($async)
+                                return $true
+                            } catch { return $false }
+                            finally {
+                                if ($async) { $async.AsyncWaitHandle.Close() }
+                                $client.Dispose()
+                            }
                         }
 
                         $udpClient = New-Object System.Net.Sockets.UdpClient
@@ -236,6 +330,8 @@ function Test-Port_RemoteToLocal {
 
                     if ($result) {
                         "`tPort $port_type $port opened on local system" >> $log_connection
+                    } elseif ($port_type -eq 'UDP') {
+                        "`tPort UDP ${port}: no reply received; result inconclusive" >> $log_connection
                     } else {
                         "`tAttention!! Port $port_type $port closed on local system!" >> $log_connection
                     }
@@ -245,9 +341,11 @@ function Test-Port_RemoteToLocal {
                 }
             } elseif ($flag_OS -eq "Linux") {
                 try {
-                    $cred = obtain_cred
-                    # to initialize the SSH connection to the system (accepting automatically the host key)
-                    $session = New-SSHSession -ComputerName $system -Credential $cred -ErrorAction Stop -AcceptKey
+                    # AcceptKey is intentionally opt-in: trusting unknown SSH keys by
+                    # default would hide a possible host-identity change/MITM attack.
+                    $sshArgs = @{ ComputerName = $system; Credential = $cred; ErrorAction = 'Stop' }
+                    if ($TrustSshHostKey) { $sshArgs.AcceptKey = $true }
+                    $session = New-SSHSession @sshArgs
 
                     # Write-Host -ForegroundColor "green" "Connected to $system"
                     # to run remote commands as if you were on the Linux system
@@ -259,8 +357,12 @@ function Test-Port_RemoteToLocal {
 
                     $result = Invoke-SSHCommand -SSHSession $session -Command $cmd
 
+                    # Exit 127 means nc is missing. For UDP, even exit 0 is not proof
+                    # of an open port, because there is no handshake to validate it.
                     if ($result.ExitStatus -eq 127) {
                         "`tAttention!! The command 'netcat' has not been found on remote system, you should install it before continue!" >> $log_connection
+                    } elseif ($port_type -eq 'UDP') {
+                        "`tPort UDP ${port}: netcat exit status $($result.ExitStatus); result inconclusive" >> $log_connection
                     } elseif ($result.ExitStatus -eq 0) {
                         "`tPort $port_type $port opened on local system" >> $log_connection
                     } else {
@@ -291,11 +393,19 @@ function Test-Port_RemoteToLocal {
 $script = $MyInvocation.MyCommand.Name
 $date = Get-Date -f yyyy-MM-dd_HH-mm-ss
 $local_system = $env:COMPUTERNAME       # environment variable with the computer name
-$local_ip = (Get-NetIPAddress -AddressState Preferred -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike "*Loopback*" } | Select-Object -First 1).IPAddress
-$work_dir = "C:\temp"
-$system_list = Join-Path $work_dir "system.txt"     # if exist C:\Temp instead of C:\temp, the script does not fail
+try {
+    # Initial fallback address for help/log output. Inside the host loop it is replaced
+    # with the address selected for the route to that specific destination.
+    $local_ip = (Get-NetIPAddress -AddressState Preferred -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -notlike '169.254.*' } |
+        Select-Object -First 1).IPAddress
+} catch {
+    $local_ip = $null
+    Write-Warning "Unable to determine the local IPv4 address: $($_.Exception.Message)"
+}
+$work_dir = $WorkDirectory
+$system_list = if ($SystemListPath) { $SystemListPath } else { Join-Path $work_dir "system.txt" }
 $log_connection = Join-Path $work_dir "log_connection-$date.log"
-$Timeout = 1000
 $list_ports_local_to_remote = @()
 $list_ports_remote_to_local = @()
 $cont_system = 1
@@ -323,29 +433,41 @@ if ([string]::IsNullOrWhiteSpace($port_type) -or [string]::IsNullOrWhiteSpace($p
                     $file_content = Get-Content $system_list
 
                     foreach ($system in $file_content) {
-                        if ($system.Length -eq 0) {
+                        $system = $system.Trim()
+                        if ([string]::IsNullOrWhiteSpace($system)) {
                             continue        # to skip the empty row
                         } else {
                             Start-Sleep -Seconds 1.0
-                            $system = $system.Trim()        # to remove all leading and trailing white-space characters
+                            $routed_ip = Get-LocalIpForRemoteSystem -ComputerName $system
+                            if ($routed_ip) { $local_ip = $routed_ip }
                             Write-Host -ForegroundColor "green" "`nTesting the remote system: $system ...`n"
                             "`n$cont_system) Remote system = $system`n" >> $log_connection
 
-                            if (Test-Connection -ComputerName $system -Count 2 -Quiet) {
+                            # Ping is diagnostic only. Firewalls often block ICMP while
+                            # allowing the TCP/UDP ports that this script must test.
+                            if (Test-Connection -ComputerName $system -Count 2 -Quiet -ErrorAction SilentlyContinue) {
                                 "`tPing OK" >> $log_connection
-                                Test-Port_LocalToRemote
-
-                                if ($list_ports_remote_to_local.Length -ne 0) {    # if there are also some ports to test from remote to local system...
-                                    $safe_system_name = $system -replace '[\\/:*?"<>|]', '_'
-                                    $file_cred = Join-Path $work_dir "file_cred_$safe_system_name.cred"
-                                    $flag_OS = Test-OS_System
-                                    Write-Host "  OS remote system: $flag_OS"
-                                    Test-Port_RemoteToLocal
-                                    # Remove-Item $file_cred
-                                }
                             } else {
                                 Write-Host -ForegroundColor "red" "  Ping KO"
-                                "`tPing KO" >> $log_connection
+                                "`tPing KO (port tests continue because ICMP may be blocked)" >> $log_connection
+                            }
+
+                            Test-Port_LocalToRemote
+                            if ($list_ports_remote_to_local.Length -ne 0 -and $local_ip) {
+                                # Replace invalid filename characters before using the host
+                                # name as part of the optional credential-cache filename.
+                                $safe_system_name = $system -replace '[\\/:*?"<>|]', '_'
+                                $file_cred = Join-Path $work_dir "file_cred_$safe_system_name.cred"
+                                try {
+                                    $cred = Get-SavedCredential
+                                    $flag_OS = Test-OS_System -cred $cred
+                                    Write-Host "  OS remote system: $flag_OS"
+                                    Test-Port_RemoteToLocal -cred $cred
+                                } catch {
+                                    "`tRemote tests skipped: $($_.Exception.Message)" >> $log_connection
+                                }
+                            } elseif ($list_ports_remote_to_local.Length -ne 0) {
+                                "`tRemote tests skipped: unable to determine the local route address" >> $log_connection
                             }
                         }
 
