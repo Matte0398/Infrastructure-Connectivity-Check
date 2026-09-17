@@ -1,167 +1,103 @@
-# Infrastructure-Connectivity-Check
+# Infrastructure Connectivity Check
 
-## Description
-
-PowerShell script that tests TCP or UDP port connectivity between a **local Windows machine** and one or more **remote systems** (Windows or Linux). It supports testing ports in both directions:
-
-- **Local → Remote:** tests whether specified ports are open on the remote systems
-- **Remote → Local:** tests whether specified ports are open on the local machine, as seen from each remote system
-
-All results are saved to a timestamped log file.
+`TestPort.ps1` tests TCP or UDP connectivity between a local Windows computer and one or more remote Windows or Linux systems. It can test ports from the local computer to the remote systems (`-L`) and, optionally, from each remote system back to the local computer (`-R`). Results are written to a timestamped log file.
 
 ## Requirements
 
-### On the LOCAL machine (always required)
+- Windows PowerShell 5.1 or later on the local computer.
+- A file containing one host name or IP address per line. By default, the script reads `C:\temp\system.txt`.
+- For reverse tests from Windows: PowerShell Remoting/WinRM enabled on the remote system and credentials with remoting access.
+- For reverse tests from Linux: the `Posh-SSH` module on the local computer and `nc` (netcat) on the remote system.
 
-- **PowerShell 5.1** or later
-- A file `C:\temp\system.txt` with the list of remote systems to test
-
-### For Remote → Local tests on **Linux** remote systems
-
-The **Posh-SSH** PowerShell module must be installed on the local machine:
+Install the SSH module if needed:
 
 ```powershell
-Install-Module -Name Posh-SSH -Force
+Install-Module -Name Posh-SSH
 ```
 
-The **netcat** (`nc`) utility must be installed on each Linux remote system:
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install netcat -y
-
-# RHEL/CentOS
-sudo yum install nmap-ncat -y
-```
-
-### For Remote → Local tests on **Windows** remote systems
-
-- **WinRM** must be enabled on the remote Windows system (see below)
-- The remote user must have PowerShell Remoting access
+If needed, enable PowerShell Remoting on the remote Windows system by running this command there as an administrator:
 
 ```powershell
-# On the remote Windows system, run as Administrator
 Enable-PSRemoting -Force
 ```
 
-**Notes:**
-- Invalid port values (non-numeric, out of range 1–65535) are automatically ignored with a warning.
-- If `-R` is omitted, only the local → remote direction is tested.
+For example, `system.txt` may contain:
 
-## Configuration File
-
-### `C:\temp\system.txt` — list of remote systems
-
-One entry per line. Each entry can be a **hostname** or an **IP address**:
-
-```
+```text
 server01
 192.168.1.20
 linux-host01
-192.168.1.35
 ```
 
-**Rules:**
-- One system per line
-- Blank lines are skipped
-- If a system does not respond to ping, it is skipped entirely
+Blank and whitespace-only lines are ignored. The ping result is recorded, but a missing reply **does not** stop the port tests: a firewall may block ICMP.
 
-## Running the Script
+## Usage
 
-Open PowerShell as **Administrator** and run:
+Run the script from the directory that contains it:
 
 ```powershell
-# First run only: allow script execution
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+# Test only from the local computer to the remote systems
+.\TestPort.ps1 -T TCP -L 80,443
 
-# 1) Test TCP ports from local to remote only
-.\TestPort.ps1 -T TCP -L 5985,3389
+# Test in both directions with a remote Windows system
+.\TestPort.ps1 -T TCP -L 5985,3389 -R 8080,3183 -RemoteOS Windows
 
-# 2) Test UDP ports from local to remote only
-.\TestPort.ps1 -T UDP -L 161,162
+# Test UDP with a remote Linux system and a two-second timeout
+.\TestPort.ps1 -T UDP -L 161,162 -R 514 -RemoteOS Linux -Timeout 2000
 
-# 3) Test TCP ports in both directions (local→remote AND remote→local)
-.\TestPort.ps1 -T TCP -L 5985,3389 -R 8080,3183
-
-# 4) Using aliases (shorter form)
-.\TestPort.ps1 -T tcp -L 443,80 -R 8443
+# Use a custom host list and log directory
+.\TestPort.ps1 -T TCP -L '80,443' -SystemListPath 'D:\network\hosts.txt' -WorkDirectory 'D:\network\logs'
 ```
 
-## OS Detection (Remote → Local tests)
+`-T`, `-L`, and `-R` are aliases for `-port_type`, `-ports_local_to_remote`, and `-ports_remote_to_local`, respectively. Ports can be supplied as a PowerShell list (`80,443`) or a comma-separated string (`'80,443'`). Non-numeric values and ports outside the range 1–65535 are ignored with a warning. `-L` must contain at least one valid port. When `-R` is omitted, no credentials or remote sessions are needed.
 
-When `-R` is specified, the script automatically detects the OS of each remote system before testing:
+| Parameter | Description |
+| --- | --- |
+| `-RemoteOS Auto\|Windows\|Linux` | `Auto` (the default) tries WinRM, then SSH. `Windows` or `Linux` skips automatic detection. |
+| `-Timeout <ms>` | Socket test timeout, from 100 to 60000 ms. Default: 1000 ms. |
+| `-WorkDirectory <path>` | Working and log directory. Default: `C:\temp`. |
+| `-SystemListPath <path>` | Host list. Default: `system.txt` in the working directory. |
+| `-Credential <PSCredential>` | Credential for remote-to-local tests. |
+| `-SaveCredential` | Saves and reuses a credential for each remote system. Without this switch, credentials are not saved. |
+| `-TrustSshHostKey` | Automatically accepts an unknown SSH host key. Use only when you trust the host. |
 
-| Check | Result |
-|---|---|
-| Port **3389/TCP** open | Remote system is **Windows** |
-| Port **22/TCP** open | Remote system is **Linux** |
-| Neither port open | Remote system is **Unrecognized** — remote → local test is skipped |
+To supply credentials explicitly:
 
-For **Windows** remote systems, the test is performed via `Invoke-Command` (WinRM).  
-For **Linux** remote systems, the test is performed via SSH (`Posh-SSH`) using the `netcat` command.
-
-## Credentials (Remote → Local tests only)
-
-Credentials are required only when testing the remote → local direction. The script caches credentials per remote system in an encrypted `.cred` file under `C:\temp\`:
-
-```
-C:\temp\file_cred_<system_name>.cred
+```powershell
+$cred = Get-Credential
+.\TestPort.ps1 -T TCP -L 443 -R 8080 -RemoteOS Windows -Credential $cred
 ```
 
-If the file already exists, it is reused automatically. If not, a credential prompt appears the first time.
+Without `-Credential`, reverse tests prompt for credentials for each remote system. With `-SaveCredential`, a `file_cred_<system_name>.cred` file is created in the working directory and reused on later runs. Data exported with `Export-Clixml` is protected by Windows DPAPI and can normally be decrypted only by the same user on the same computer. An explicitly supplied `-Credential` takes precedence over a saved file.
 
-> **Note:** To force a fresh credential prompt, delete the corresponding `.cred` file before running the script.
+## Remote OS detection
 
-## Output
+Detection runs only when `-R` is specified and `-RemoteOS` is `Auto`:
 
-### Log file
+1. The script attempts a PowerShell Remoting session over WinRM. If it succeeds, the Windows path is used.
+2. Otherwise, it attempts an SSH session and runs `uname -s`. If the command identifies Linux, the Linux path is used.
+3. If neither attempt identifies the system, the script records `Unrecognized` and skips reverse port tests for that host.
 
-A timestamped log file is created at each run:
+The script **does not** infer the OS from port 3389 or from port 22 merely being open. If you already know the OS, use `-RemoteOS Windows` or `-RemoteOS Linux` to skip detection. Reverse tests still require working WinRM or SSH access and valid credentials.
 
-```
-C:\temp\log_connection-YYYY-MM-DD_HH-mm-ss.log
-```
+## Results and limitations
 
-The log contains, for each remote system:
-- Ping result
-- OS detection result (when `-R` is used)
-- Port test result for each port in each direction
+The log is written to `log_connection-YYYY-MM-DD_HH-mm-ss.log` in the working directory. It includes ping results, OS detection (when needed), and each port-test result. The script does not generate a CSV file.
 
-**Example log output:**
+For TCP, a successful test confirms that a connection was established. A failed attempt is logged as a closed port, but the log does not always distinguish a refusal from a timeout, firewall filtering, or a name-resolution error.
 
-```
-Tests made from MYPC (192.168.1.5)
----------------------------------------
+For UDP, no response is logged as **inconclusive**, not as a closed port: many services ignore probe packets they do not recognize. Likewise, `nc -zu` on Linux cannot by itself confirm that a UDP port is open. Reliable UDP testing requires a valid request for the application protocol and, if needed, a dedicated tool.
 
-1) Remote system = server01
-
-    Ping OK
-    Port TCP 5985 opened on remote system
-    Port TCP 3389 opened on remote system
-    OS remote system: Windows
-    Port TCP 8080 opened on local system
-    Attention!! Port TCP 3183 closed on local system!
-
-2) Remote system = 192.168.1.99
-
-    Ping KO
-```
-
-## UDP Testing — Important Note
-
-> UDP is a **connectionless** protocol. An open UDP port may not send any response to a probe packet, which means:
-> - A **timeout** is interpreted as "closed" even if the port is actually open and filtering responses.
-> - UDP test results should be considered **indicative only**.
-
-For reliable UDP testing, use dedicated tools (e.g. `nmap`) in addition to this script.
+The local IP address used for reverse tests is selected based on the route to each remote system. If no local address can be determined, reverse tests for that host are skipped.
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| `Posh-SSH module not found` | Run `Install-Module -Name Posh-SSH -Force` as Administrator |
-| `netcat not found on remote Linux` | Install `nc` on the Linux remote system (see Requirements) |
-| Ping fails for a known-online system | The system may block ICMP — check firewall rules on the remote host |
-| Remote → Local test fails on Windows | Verify WinRM is enabled on the remote system and credentials are correct |
-| `.cred` file causes auth errors | Delete `C:\temp\file_cred_<system>.cred` and re-run to re-enter credentials |
-| `system.txt not found` | Create the file at `C:\temp\system.txt` with one hostname or IP per line |
+| Problem | What to check |
+| --- | --- |
+| `system.txt` not found | Create it in the working directory or use `-SystemListPath`. |
+| Ping fails | Port tests still continue; check their results in the log. |
+| OS detection returns `Unrecognized` | Check WinRM/SSH, credentials, the SSH host key, and the log. If you know the OS, use `-RemoteOS`. |
+| `Posh-SSH` module is missing | Install the module on the local computer. |
+| `nc` is missing | Install netcat on the remote Linux system. |
+| Reverse test from Windows fails | Check WinRM, the user's remoting permissions, and the firewall. |
+| Saved `.cred` file no longer works | Remove that host's credential file and enter credentials again, or supply `-Credential`. |
